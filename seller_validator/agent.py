@@ -7,11 +7,18 @@ import json
 import logging
 import os
 from datetime import date, datetime, timezone
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional, Sequence
+from pathlib import Path
+from typing import Any, Dict, Optional, Sequence
 
 import avito_library
-from avito_library import collect_seller_items, detect_page_state, resolve_captcha_flow
+from avito_library import (
+    NOT_DETECTED_STATE_ID,
+    collect_seller_items,
+    detect_page_state,
+    resolve_captcha_flow,
+)
 from avito_library.detectors.captcha_geetest_detector import DETECTOR_ID as CAPTCHA_DETECTOR_ID
 from avito_library.detectors.continue_button_detector import DETECTOR_ID as CONTINUE_BUTTON_DETECTOR_ID
 from avito_library.detectors.proxy_auth_407_detector import DETECTOR_ID as PROXY_AUTH_407_DETECTOR_ID
@@ -49,6 +56,176 @@ class TaskStatus(Enum):
     RETRY = "retry"
     RETRY_NEW_PROXY = "retry_new_proxy"
     ABANDON = "abandon"
+    DEFERRED = "deferred"
+
+
+@dataclass(slots=True)
+class ValidationJob:
+    task: ProcessingTask
+    seller_url: str
+    seller_name: str | None
+    items: list[Dict[str, Any]]
+    attempt: int
+    last_proxy: str | None
+
+
+class ValidationExecutor:
+    def __init__(
+        self,
+        *,
+        config: Config,
+        analyzer: GeminiAnalyzer | OpenAIAnalyzer,
+        json_writer: JsonArrayWriter,
+        task_queue: TaskQueue,
+        processed_urls: set[str],
+        processed_urls_lock: asyncio.Lock,
+        processed_urls_path: os.PathLike[str] | str,
+        passed_urls_path: os.PathLike[str] | str,
+    ) -> None:
+        self._config = config
+        self._analyzer = analyzer
+        self._json_writer = json_writer
+        self._task_queue = task_queue
+        self._processed_urls = processed_urls
+        self._processed_urls_lock = processed_urls_lock
+        self._processed_urls_path = Path(processed_urls_path)
+        self._passed_urls_path = Path(passed_urls_path)
+        self._jobs: asyncio.Queue[ValidationJob | None] = asyncio.Queue()
+        self._workers: list[asyncio.Task[None]] = []
+        self._concurrency = max(1, self._config.llm_concurrency)
+        self._semaphore = asyncio.Semaphore(self._concurrency)
+        self._started = False
+        self._logger = logging.getLogger("seller_validator.validation")
+        self._inflight = 0
+        self._inflight_lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        for idx in range(self._concurrency):
+            worker = asyncio.create_task(self._worker_loop(idx), name=f"validation-worker-{idx}")
+            self._workers.append(worker)
+
+    async def submit(self, job: ValidationJob) -> None:
+        if not self._started:
+            await self.start()
+        async with self._inflight_lock:
+            self._inflight += 1
+        await self._jobs.put(job)
+
+    async def shutdown(self) -> None:
+        if not self._started:
+            return
+        # дождаться, пока вся очередь будет обработана
+        await self._jobs.join()
+        for _ in self._workers:
+            await self._jobs.put(None)
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        self._workers.clear()
+        self._started = False
+        async with self._inflight_lock:
+            self._inflight = 0
+
+    async def _worker_loop(self, worker_id: int) -> None:
+        while True:
+            job = await self._jobs.get()
+            if job is None:
+                self._jobs.task_done()
+                break
+            async with self._semaphore:
+                try:
+                    await self._process_job(job, worker_id=worker_id)
+                finally:
+                    self._jobs.task_done()
+
+    async def _process_job(self, job: ValidationJob, *, worker_id: int) -> None:
+        try:
+            self._logger.info(
+                "Validation worker %s processing %s (attempt %s)",
+                worker_id,
+                job.seller_url,
+                job.attempt,
+            )
+            try:
+                result = await self._analyzer.analyze(
+                    seller_url=job.seller_url,
+                    seller_name=job.seller_name,
+                    items=job.items,
+                    attempt=job.attempt,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._logger.exception(
+                    "Validation worker %s failed for %s: %s",
+                    worker_id,
+                    job.seller_url,
+                    exc,
+                )
+                await self._retry_task(job, reason="validation_exception")
+                return
+
+            verdict = result.get("verdict")
+            if verdict == "error":
+                self._logger.warning(
+                    "Validation worker %s got error verdict for %s, scheduling retry",
+                    worker_id,
+                    job.seller_url,
+                )
+                await self._retry_task(job, reason="validation_error_verdict")
+                return
+
+            record = {
+                "seller_url": job.seller_url,
+                "verdict": verdict,
+                "reason": result.get("reason"),
+            }
+            await self._json_writer.append(record)
+            append_processed_url(self._processed_urls_path, job.seller_url)
+            async with self._processed_urls_lock:
+                self._processed_urls.add(job.seller_url)
+            if verdict == "passed":
+                append_valid_url(self._passed_urls_path, job.seller_url)
+
+            await self._task_queue.mark_done(job.task.task_key)
+            self._logger.info(
+                "Validation worker %s finished %s with verdict=%s",
+                worker_id,
+                job.seller_url,
+                verdict,
+            )
+        finally:
+            await self._job_finished()
+
+    async def _retry_task(self, job: ValidationJob, *, reason: str) -> None:
+        succeeded = await self._task_queue.retry(
+            job.task.task_key, last_proxy=job.last_proxy
+        )
+        if not succeeded:
+            self._logger.error(
+                "Retry limit exceeded for %s, abandoning task", job.seller_url
+            )
+            await self._task_queue.abandon(job.task.task_key)
+            record = {
+                "seller_url": job.seller_url,
+                "verdict": "error",
+                "reason": f"{reason}: retry limit exceeded",
+            }
+            await self._json_writer.append(record)
+            append_processed_url(self._processed_urls_path, job.seller_url)
+            async with self._processed_urls_lock:
+                self._processed_urls.add(job.seller_url)
+        else:
+            self._logger.info(
+                "Retry scheduled for %s due to %s", job.seller_url, reason
+            )
+
+    async def _job_finished(self) -> None:
+        async with self._inflight_lock:
+            self._inflight = max(0, self._inflight - 1)
+
+    async def has_pending_jobs(self) -> bool:
+        async with self._inflight_lock:
+            return self._inflight > 0
 
 
 class SellerValidatorAgent:
@@ -63,11 +240,22 @@ class SellerValidatorAgent:
         self._analyzer = self._create_analyzer()
         self._json_writer = JsonArrayWriter(self.config.results_json)
         self._processed_urls = read_processed_urls(self.config.processed_urls_txt)
+        self._processed_urls_lock = asyncio.Lock()
         self._active_lock = asyncio.Lock()
         self._active_tasks = 0
         self._shutdown_event = asyncio.Event()
         self._workers: list[asyncio.Task[None]] = []
         self._payload_logger = logging.getLogger("seller_validator.payload")
+        self._validation_executor = ValidationExecutor(
+            config=self.config,
+            analyzer=self._analyzer,
+            json_writer=self._json_writer,
+            task_queue=self._queue,
+            processed_urls=self._processed_urls,
+            processed_urls_lock=self._processed_urls_lock,
+            processed_urls_path=self.config.processed_urls_txt,
+            passed_urls_path=self.config.passed_urls_txt,
+        )
 
     async def run(self) -> None:
         # Очистка результатов Gemini с ошибками 429/503 перед формированием очереди
@@ -78,22 +266,25 @@ class SellerValidatorAgent:
         await self._seed_queue()
         logger.info("DISPLAY env: %s", os.environ.get("DISPLAY"))
         pending = await self._queue.pending_count()
-        if pending == 0:
-            logger.info("Нет новых URL для обработки")
+        try:
+            if pending == 0:
+                logger.info("Нет новых URL для обработки")
+                return
+
+            await self._validation_executor.start()
+
+            async with async_playwright() as playwright:
+                self._workers = [
+                    asyncio.create_task(self._worker_loop(worker_id=i, playwright=playwright))
+                    for i in range(self.config.worker_count)
+                ]
+                await self._shutdown_event.wait()
+                for task in self._workers:
+                    task.cancel()
+                await asyncio.gather(*self._workers, return_exceptions=True)
+        finally:
+            await self._validation_executor.shutdown()
             await self._analyzer.close()
-            return
-
-        async with async_playwright() as playwright:
-            self._workers = [
-                asyncio.create_task(self._worker_loop(worker_id=i, playwright=playwright))
-                for i in range(self.config.worker_count)
-            ]
-            await self._shutdown_event.wait()
-            for task in self._workers:
-                task.cancel()
-            await asyncio.gather(*self._workers, return_exceptions=True)
-
-        await self._analyzer.close()
 
     def _create_analyzer(self):
         if self.config.llm_provider is LLMProvider.GENAI:
@@ -167,6 +358,9 @@ class SellerValidatorAgent:
 
             if status == TaskStatus.ABANDON:
                 await self._queue.abandon(task.task_key)
+                continue
+
+            if status == TaskStatus.DEFERRED:
                 continue
 
             if status == TaskStatus.RETRY_NEW_PROXY:
@@ -280,18 +474,26 @@ class SellerValidatorAgent:
             await self._mark_proxy_blocked(proxy.address, state)
             return TaskStatus.RETRY_NEW_PROXY
 
+        if state == NOT_DETECTED_STATE_ID:
+            logger.info("Детекторы не сработали для %s, помечаем как not_detected", url)
+            return TaskStatus.ABANDON
+
         if state != SELLER_PROFILE_DETECTOR_ID:
             logger.info("Не удалось подтвердить профиль для %s: %s", url, state)
-            return TaskStatus.RETRY
+            return TaskStatus.ABANDON
 
         seller_result = await collect_seller_items(
             page,
             include_items=True,
             item_schema=self.config.seller_schema,
         )
-        if seller_result.get("state") != SELLER_PROFILE_DETECTOR_ID:
-            logger.info("collect_seller_items вернул состояние %s для %s", seller_result.get("state"), url)
-            return TaskStatus.RETRY
+        seller_state = seller_result.get("state")
+        if seller_state == NOT_DETECTED_STATE_ID:
+            logger.info("collect_seller_items не нашёл профиль для %s (not_detected)", url)
+            return TaskStatus.ABANDON
+        if seller_state != SELLER_PROFILE_DETECTOR_ID:
+            logger.info("collect_seller_items вернул состояние %s для %s", seller_state, url)
+            return TaskStatus.ABANDON
 
         raw_items: dict = seller_result.get("items_by_id") or {}
         items = self._prepare_items(raw_items)
@@ -313,25 +515,18 @@ class SellerValidatorAgent:
         )
         self._payload_logger.info(json.dumps(log_entry, ensure_ascii=False))
 
-        gemini_result = await self._analyzer.analyze(
-            seller_url=url,
-            seller_name=seller_name,
-            items=items,
-            attempt=task.attempt,
+        await self._validation_executor.submit(
+            ValidationJob(
+                task=task,
+                seller_url=url,
+                seller_name=seller_name,
+                items=items,
+                attempt=task.attempt,
+                last_proxy=proxy.address if proxy else None,
+            )
         )
-
-        record = {
-            "seller_url": url,
-            "verdict": gemini_result.get("verdict"),
-            "reason": gemini_result.get("reason"),
-        }
-        await self._json_writer.append(record)
-        append_processed_url(self.config.processed_urls_txt, url)
-        self._processed_urls.add(url)
-        if gemini_result.get("verdict") == "passed":
-            append_valid_url(self.config.passed_urls_txt, url)
-        logger.info("Обработка %s завершена", url)
-        return TaskStatus.DONE
+        logger.info("Данные для %s отправлены на валидацию", url)
+        return TaskStatus.DEFERRED
 
     async def _solve_captcha(self, page: Page) -> bool:
         try:
@@ -418,7 +613,8 @@ class SellerValidatorAgent:
         async with self._active_lock:
             active = self._active_tasks
         pending = await self._queue.pending_count()
-        return active == 0 and pending == 0
+        validation_pending = await self._validation_executor.has_pending_jobs()
+        return active == 0 and pending == 0 and not validation_pending
 
     async def _close_browser(self, browser, context, page) -> None:
         if page:

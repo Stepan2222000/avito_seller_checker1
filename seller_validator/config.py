@@ -35,7 +35,7 @@ class Config:
     navigation_timeout_ms: int = 30_000
 
     llm_provider: LLMProvider = LLMProvider.OPENAI
-    llm_concurrency: int = 10
+    llm_concurrency: int = 30
     llm_request_timeout: float = 60.0
     llm_max_retries: int = 3
 
