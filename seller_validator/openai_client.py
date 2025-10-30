@@ -74,7 +74,12 @@ class OpenAIAnalyzer:
                     # DeepSeek Terminus поддерживает режим «thinking»,
                     # который включается флагом reasoning_enabled.
                     if self.config.deepinfra_reasoning_enabled is not None:
-                        request_kwargs["reasoning_enabled"] = self.config.deepinfra_reasoning_enabled
+                        # DeepInfra принимает флаг reasoning_enabled, но OpenAI SDK не
+                        # разрешает незнакомые аргументы в корне запроса, поэтому отправляем
+                        # его через extra_body.
+                        request_kwargs["extra_body"] = {
+                            "reasoning_enabled": self.config.deepinfra_reasoning_enabled
+                        }
                     reasoning_effort = (self.config.deepinfra_reasoning_effort or "").strip()
                     if reasoning_effort:
                         request_kwargs["reasoning_effort"] = reasoning_effort
