@@ -68,6 +68,61 @@ class Config:
         }
     )
 
+    # Keyword filter settings
+    keyword_filter_enabled: bool = True
+    keyword_filter_threshold: int = 4  # Минимум вхождений для блокировки
+
+    prohibited_keywords: list[str] = field(
+        default_factory=lambda: [
+            # Состояние
+            "б/у", "бу", "с пробегом", "восстановленный", "контрактный",
+            "был в использовании", "после эксплуатации", "бывший в употреблении",
+            "бывшие в использовании", "бывшая в эксплуатации",
+
+            # Не оригинал
+            "аналог", "не оригинал", "неоригинал", "aftermarket",
+            "копия", "реплика", "аналоговый", "аналогичный",
+
+            # Разборка
+            "разборка", "демонтаж", "снят с авто", "авторазбор",
+            "с разборки", "разбор", "авто разбор",
+
+            # Происхождение
+            "китай", "китайский", "корея", "турция", "китайская",
+        ]
+    )
+
+    prohibited_brands: list[str] = field(
+        default_factory=lambda: [
+            "ZF", "Lemförder", "Sachs", "TRW", "LuK", "INA", "FAG",
+            "Monroe", "MOOG", "Ferodo", "Walker", "Champion", "Fel-Pro",
+            "Goetze", "Glyco", "Payen", "Nural", "AE", "Sealed Power",
+            "febi", "SWAG", "Blue Print", "VDO", "ATE", "Continental",
+            "ContiTech", "MANN-FILTER", "WIX Filters", "FILTRON",
+            "Purflux", "FRAM", "UFI Filters", "SOFIMA", "MAHLE",
+            "Knecht", "Behr", "Hengst", "SKF", "NTN", "NSK", "GMB",
+            "GSP", "CTR", "Sankei 555", "Sidem", "Teknorot",
+            "Original Birth", "BIRTH", "Metalcaucho", "Herth+Buss Jakoparts",
+            "TOPRAN", "Hans Pries", "MEYLE", "URO Parts", "KYB",
+            "Bilstein", "Koni", "Brembo", "Textar", "Pagid", "Mintex",
+            "Bendix", "Akebono", "EBC Brakes", "StopTech", "Centric",
+            "PowerStop", "Remsa", "ICER", "LPR", "A.B.S.",
+            "All Brake Systems", "Hella", "Magneti Marelli", "TYC",
+            "DEPO", "Van Wezel", "Klokkerholm", "Prasco", "Nissens",
+            "NRF", "Pierburg", "Carter", "Victor Reinz", "Elring",
+            "Ajusa", "Corteco", "NPR", "Nippon Piston Ring", "Hastings",
+            "Kolbenschmidt", "Dorman", "GKN", "VEMO", "VAICO", "Gates",
+            "Hutchinson", "Four Seasons", "JP Group", "Metzger",
+            "Comline", "Mapco", "Dayco", "Bando", "Optibelt", "Koyo",
+            "SNR", "Timken", "Nisshinbo", "Zimmermann", "Raybestos",
+            "Gabriel", "Delphi Technologies", "Beck/Arnley",
+            "Standard Motor Products", "SMP", "Hepu", "Saleri", "Graf",
+            "Dolz", "Airtex", "GKN Spidan", "King Engine Bearings",
+            "Exedy", "AISIN", "Cloyes", "Cardone", "Baldwin Filters",
+            "CoopersFiaam",
+        ]
+    )
+
     worker_relaunch_delay: float = 3.0
     checkpoint_flush_interval: int = 1
 

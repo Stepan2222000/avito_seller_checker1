@@ -47,6 +47,7 @@ from .io_utils import (
     filter_results_by_reason_codes,
     read_results_urls,
 )
+from .keyword_filter import check_keyword_filter
 
 # Database imports (conditionally used based on config)
 import asyncpg
@@ -641,6 +642,35 @@ class SellerValidatorAgent:
         items = self._prepare_items(raw_items)
         seller_name = seller_result.get("seller_name")
 
+        # Keyword filter check
+        if self.config.keyword_filter_enabled:
+            is_blocked, count, found_keywords = check_keyword_filter(
+                items=items,
+                seller_name=seller_name,
+                config=self.config,
+            )
+
+            if is_blocked:
+                logger.info(
+                    "Keyword filter BLOCKED %s: found %d prohibited occurrences (threshold: %d)",
+                    url,
+                    count,
+                    self.config.keyword_filter_threshold,
+                )
+                # Лог первых 10 найденных слов
+                sample_keywords = list(set(found_keywords))[:10]
+                logger.debug("Sample blocked keywords for %s: %s", url, sample_keywords)
+
+                # Сохранить результат без LLM
+                await self._save_keyword_filtered_result(
+                    url=url,
+                    task=task,
+                    count=count,
+                    found_keywords=found_keywords,
+                )
+
+                return TaskStatus.DONE
+
         first_item = items[0] if items else {}
         log_entry = {
             "seller_url": url,
@@ -742,6 +772,60 @@ class SellerValidatorAgent:
                     if isinstance(text, str):
                         results.append(text)
         return results
+
+    async def _save_keyword_filtered_result(
+        self,
+        url: str,
+        task: ProcessingTask,
+        count: int,
+        found_keywords: list[str],
+    ) -> None:
+        """Сохраняет результат для продавца, отклонённого по keyword-фильтру."""
+        reason = (
+            f"keyword_filter: found {count} prohibited occurrences "
+            f"(threshold: {self.config.keyword_filter_threshold})"
+        )
+        # Берем уникальные слова для flags, ограничиваем до 20
+        unique_keywords = list(dict.fromkeys(found_keywords))[:20]
+        flags = ["keyword_filter"] + unique_keywords
+
+        if self.config.use_database and self._result_repository:
+            # Режим БД: сохранение в таблицу results
+            task_id = None
+            if isinstance(task.payload, dict):
+                task_id = task.payload.get("_db_task_id")
+
+            if task_id:
+                await self._result_repository.save_result(
+                    task_id=task_id,
+                    seller_url=url,
+                    verdict="failed",
+                    reason=reason,
+                    confidence=1.0,  # Полная уверенность в фильтре
+                    flags=flags,
+                    items=[],
+                    llm_attempts=0,
+                )
+                logger.info("Saved keyword-filtered result to database for %s", url)
+            else:
+                logger.error("Task ID not found in payload for %s", url)
+        else:
+            # Файловый режим: сохранение в results.json
+            record = {
+                "seller_url": url,
+                "verdict": "failed",
+                "reason": reason,
+                "confidence": 1.0,
+                "flags": flags,
+            }
+            await self._json_writer.append(record)
+            append_processed_url(self.config.processed_urls_txt, url)
+
+        # Обновить processed_urls tracking (оба режима)
+        async with self._processed_urls_lock:
+            self._processed_urls.add(url)
+
+        await self._queue.mark_done(task.task_key)
 
     async def _mark_proxy_blocked(self, address: str, reason: str) -> None:
         if self._proxy_pool is not None:
