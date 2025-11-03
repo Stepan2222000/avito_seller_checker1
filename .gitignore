@@ -25,6 +25,5 @@ data/gemini_payloads.log
 !data/urls.txt
 !data/proxies.txt
 
-# Secrets
-*.json
-!gen-lang-client-0026618973-91c1fd5d6f57.json
+# Secrets - service account keys should not be committed
+gen-lang-client-*.json
