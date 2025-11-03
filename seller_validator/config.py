@@ -3,13 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
-
-
-class LLMProvider(str, Enum):
-    GENAI = "genai"
-    OPENAI = "openai"
 
 
 @dataclass(slots=True)
@@ -34,20 +28,15 @@ class Config:
     playwright_slow_mo: float | None = None
     navigation_timeout_ms: int = 30_000
 
-    llm_provider: LLMProvider = LLMProvider.OPENAI
     llm_concurrency: int = 30
     llm_request_timeout: float = 60.0
     llm_max_retries: int = 3
 
-    gemini_api_key: str = "AIzaSyBYPiXtSWY3fSQjXhPnbSP0iCzBHngpetg"
-    gemini_model: str = "gemini-2.5-flash"
-
-    deepinfra_api_key: str = "ZyqsQeDmt4bFp19aNn6kyK9mGPDgId2H"
-    deepinfra_base_url: str = "https://api.deepinfra.com/v1/openai"
-    deepinfra_model: str = "deepseek-ai/DeepSeek-V3.1-Terminus"
-    deepinfra_reasoning_effort: str = "high"
-    deepinfra_reasoning_enabled: bool = True
-    deepinfra_temperature: float = 0.0
+    # Vertex AI settings
+    vertex_project_id: str = "gen-lang-client-0026618973"
+    vertex_location: str = "global"
+    vertex_model: str = "gemini-2.5-flash-lite"
+    vertex_service_account_path: Path = field(init=False)
 
     max_items_per_seller: int = 100
     seller_schema: dict[str, object] = field(
@@ -97,9 +86,9 @@ class Config:
             "ZF", "Lemförder", "Sachs", "TRW", "LuK", "INA", "FAG",
             "Monroe", "MOOG", "Ferodo", "Walker", "Champion", "Fel-Pro",
             "Goetze", "Glyco", "Payen", "Nural", "AE", "Sealed Power",
-            "febi", "SWAG", "Blue Print", "VDO", "ATE", "Continental",
+            "febi", "SWAG", "Blue Print", "VDO", "ATE",
             "ContiTech", "MANN-FILTER", "WIX Filters", "FILTRON",
-            "Purflux", "FRAM", "UFI Filters", "SOFIMA", "MAHLE",
+            "Purflux", "FRAM", "UFI Filters", "SOFIMA",
             "Knecht", "Behr", "Hengst", "SKF", "NTN", "NSK", "GMB",
             "GSP", "CTR", "Sankei 555", "Sidem", "Teknorot",
             "Original Birth", "BIRTH", "Metalcaucho", "Herth+Buss Jakoparts",
@@ -144,5 +133,7 @@ class Config:
         self.results_json = self.data_dir / "results.json"
         self.processed_urls_txt = self.data_dir / "processed_urls.txt"
         self.passed_urls_txt = self.data_dir / "passed_urls.txt"
+
+        self.vertex_service_account_path = self.project_root / "gen-lang-client-0026618973-91c1fd5d6f57.json"
 
         self.data_dir.mkdir(parents=True, exist_ok=True)

@@ -10,6 +10,7 @@ from typing import Any, Dict, Sequence
 
 from google import genai
 from google.genai import errors, types
+from google.oauth2 import service_account
 from pydantic import BaseModel, Field, ValidationError
 
 from .config import Config
@@ -34,7 +35,19 @@ class SellerVerdictSchema(BaseModel):
 class GeminiAnalyzer:
     def __init__(self, config: Config) -> None:
         self.config = config
-        self._client = genai.Client(api_key=self.config.gemini_api_key)
+
+        # Load credentials from service account key file
+        credentials = service_account.Credentials.from_service_account_file(
+            str(self.config.vertex_service_account_path)
+        )
+
+        # Initialize Vertex AI client
+        self._client = genai.Client(
+            vertexai=True,
+            project=self.config.vertex_project_id,
+            location=self.config.vertex_location,
+            credentials=credentials,
+        )
         self._async_client = self._client.aio
         self._semaphore = asyncio.Semaphore(self.config.llm_concurrency)
 
@@ -63,7 +76,7 @@ class GeminiAnalyzer:
                 )
                 async with self._semaphore:
                     response = await self._async_client.models.generate_content(
-                        model=self.config.gemini_model,
+                        model=self.config.vertex_model,
                         contents=payload,
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",

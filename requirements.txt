@@ -1,5 +1,6 @@
 avito-library @ git+https://github.com/Stepan2222000/avito-library.git@main
 playwright==1.55.0
 google-genai==1.46.0
+google-auth>=2.0.0
 openai>=1.50.0
 asyncpg>=0.29.0

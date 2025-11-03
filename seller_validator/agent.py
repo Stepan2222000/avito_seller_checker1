@@ -35,9 +35,8 @@ from playwright.async_api import (
     async_playwright,
 )
 
-from .config import Config, LLMProvider
+from .config import Config
 from .gemini_client import GeminiAnalyzer
-from .openai_client import OpenAIAnalyzer
 from .io_utils import (
     JsonArrayWriter,
     append_processed_url,
@@ -308,7 +307,7 @@ class SellerValidatorAgent:
             self._queue = TaskQueue(max_attempts=self.config.queue_max_attempts)
 
         self._proxy_pool: ProxyPool | None = None
-        self._analyzer = self._create_analyzer()
+        self._analyzer = GeminiAnalyzer(self.config)
         self._json_writer = JsonArrayWriter(self.config.results_json)
         self._processed_urls = read_processed_urls(self.config.processed_urls_txt) if not self.config.use_database else set()
         self._processed_urls_lock = asyncio.Lock()
@@ -393,13 +392,6 @@ class SellerValidatorAgent:
             if self.config.use_database:
                 await close_pool()
                 logger.info("Database connection closed")
-
-    def _create_analyzer(self):
-        if self.config.llm_provider is LLMProvider.GENAI:
-            return GeminiAnalyzer(self.config)
-        if self.config.llm_provider is LLMProvider.OPENAI:
-            return OpenAIAnalyzer(self.config)
-        raise ValueError(f"Неизвестный LLM провайдер: {self.config.llm_provider}")
 
     async def _init_proxy_pool(self) -> None:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
