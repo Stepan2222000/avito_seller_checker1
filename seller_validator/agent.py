@@ -48,6 +48,11 @@ from .io_utils import (
     read_results_urls,
 )
 
+# Database imports (conditionally used based on config)
+import asyncpg
+from .database import create_pool, init_database, close_pool, TaskRepository, ResultRepository, ProxyRepository
+from .db_task_queue import DatabaseTaskQueue
+
 logger = logging.getLogger("seller_validator.agent")
 
 
@@ -76,11 +81,13 @@ class ValidationExecutor:
         config: Config,
         analyzer: GeminiAnalyzer | OpenAIAnalyzer,
         json_writer: JsonArrayWriter,
-        task_queue: TaskQueue,
+        task_queue: TaskQueue | DatabaseTaskQueue,
         processed_urls: set[str],
         processed_urls_lock: asyncio.Lock,
         processed_urls_path: os.PathLike[str] | str,
         passed_urls_path: os.PathLike[str] | str,
+        result_repository: Optional[ResultRepository] = None,
+        task_repository: Optional[TaskRepository] = None,
     ) -> None:
         self._config = config
         self._analyzer = analyzer
@@ -98,6 +105,10 @@ class ValidationExecutor:
         self._logger = logging.getLogger("seller_validator.validation")
         self._inflight = 0
         self._inflight_lock = asyncio.Lock()
+        # Database mode support
+        self._result_repository = result_repository
+        self._task_repository = task_repository
+        self._use_database = config.use_database
 
     async def start(self) -> None:
         if self._started:
@@ -174,17 +185,40 @@ class ValidationExecutor:
                 await self._retry_task(job, reason="validation_error_verdict")
                 return
 
-            record = {
-                "seller_url": job.seller_url,
-                "verdict": verdict,
-                "reason": result.get("reason"),
-            }
-            await self._json_writer.append(record)
-            append_processed_url(self._processed_urls_path, job.seller_url)
+            # Save result (database or file mode)
+            if self._use_database and self._result_repository:
+                # Database mode: save to results table
+                # Get task_id from payload (set by DatabaseTaskQueue.get())
+                task_id = job.task.payload.get('_db_task_id') if isinstance(job.task.payload, dict) else None
+                if task_id:
+                    await self._result_repository.save_result(
+                        task_id=task_id,
+                        seller_url=job.seller_url,
+                        verdict=verdict,
+                        reason=result.get("reason", ""),
+                        confidence=float(result.get("confidence", 0.0)),
+                        flags=result.get("flags", []),
+                        items=result.get("items", []),
+                        llm_attempts=job.attempt,
+                    )
+                    self._logger.info("Saved result to database for %s", job.seller_url)
+                else:
+                    self._logger.error("Task ID not found in payload for %s", job.seller_url)
+            else:
+                # File mode: save to JSON file
+                record = {
+                    "seller_url": job.seller_url,
+                    "verdict": verdict,
+                    "reason": result.get("reason"),
+                }
+                await self._json_writer.append(record)
+                append_processed_url(self._processed_urls_path, job.seller_url)
+                if verdict == "passed":
+                    append_valid_url(self._passed_urls_path, job.seller_url)
+
+            # Update processed URLs tracking (both modes)
             async with self._processed_urls_lock:
                 self._processed_urls.add(job.seller_url)
-            if verdict == "passed":
-                append_valid_url(self._passed_urls_path, job.seller_url)
 
             await self._task_queue.mark_done(job.task.task_key)
             self._logger.info(
@@ -205,13 +239,36 @@ class ValidationExecutor:
                 "Retry limit exceeded for %s, abandoning task", job.seller_url
             )
             await self._task_queue.abandon(job.task.task_key)
-            record = {
-                "seller_url": job.seller_url,
-                "verdict": "error",
-                "reason": f"{reason}: retry limit exceeded",
-            }
-            await self._json_writer.append(record)
-            append_processed_url(self._processed_urls_path, job.seller_url)
+
+            # Save error result (database or file mode)
+            if self._use_database and self._result_repository:
+                # Database mode: save to results table
+                # Get task_id from payload (set by DatabaseTaskQueue.get())
+                task_id = job.task.payload.get('_db_task_id') if isinstance(job.task.payload, dict) else None
+                if task_id:
+                    await self._result_repository.save_result(
+                        task_id=task_id,
+                        seller_url=job.seller_url,
+                        verdict="error",
+                        reason=f"{reason}: retry limit exceeded",
+                        confidence=0.0,
+                        flags=[],
+                        items=[],
+                        llm_attempts=job.attempt,
+                    )
+                else:
+                    self._logger.error("Task ID not found in payload for %s", job.seller_url)
+            else:
+                # File mode: save to JSON file
+                record = {
+                    "seller_url": job.seller_url,
+                    "verdict": "error",
+                    "reason": f"{reason}: retry limit exceeded",
+                }
+                await self._json_writer.append(record)
+                append_processed_url(self._processed_urls_path, job.seller_url)
+
+            # Update processed URLs tracking (both modes)
             async with self._processed_urls_lock:
                 self._processed_urls.add(job.seller_url)
         else:
@@ -235,17 +292,66 @@ class SellerValidatorAgent:
         from avito_library.parsers import seller_profile_parser
 
         seller_profile_parser.MAX_PAGE = 1
-        self._queue = TaskQueue(max_attempts=self.config.queue_max_attempts)
+
+        # Database mode initialization
+        self._db_pool: Optional[asyncpg.Pool] = None
+        self._task_repository: Optional[TaskRepository] = None
+        self._result_repository: Optional[ResultRepository] = None
+        self._proxy_repository: Optional[ProxyRepository] = None
+
+        # Initialize task queue (database or in-memory)
+        if self.config.use_database:
+            # Database queue will be initialized in run() after pool creation
+            self._queue: TaskQueue | DatabaseTaskQueue | None = None
+        else:
+            self._queue = TaskQueue(max_attempts=self.config.queue_max_attempts)
+
         self._proxy_pool: ProxyPool | None = None
         self._analyzer = self._create_analyzer()
         self._json_writer = JsonArrayWriter(self.config.results_json)
-        self._processed_urls = read_processed_urls(self.config.processed_urls_txt)
+        self._processed_urls = read_processed_urls(self.config.processed_urls_txt) if not self.config.use_database else set()
         self._processed_urls_lock = asyncio.Lock()
         self._active_lock = asyncio.Lock()
         self._active_tasks = 0
         self._shutdown_event = asyncio.Event()
         self._workers: list[asyncio.Task[None]] = []
         self._payload_logger = logging.getLogger("seller_validator.payload")
+
+        # ValidationExecutor will be initialized in run() after database setup (if needed)
+        self._validation_executor: Optional[ValidationExecutor] = None
+
+    async def run(self) -> None:
+        # Initialize database connection if in database mode
+        if self.config.use_database:
+            logger.info("Initializing database connection...")
+            self._db_pool = await create_pool(
+                host=self.config.db_host,
+                port=self.config.db_port,
+                database=self.config.db_name,
+                user=self.config.db_user,
+                password=self.config.db_password,
+                min_size=self.config.db_pool_min_size,
+                max_size=self.config.db_pool_max_size,
+            )
+            await init_database(self._db_pool)
+
+            # Initialize repositories
+            self._task_repository = TaskRepository(self._db_pool)
+            self._result_repository = ResultRepository(self._db_pool)
+            self._proxy_repository = ProxyRepository(self._db_pool)
+
+            # Initialize database task queue
+            self._queue = DatabaseTaskQueue(
+                pool=self._db_pool,
+                max_attempts=self.config.queue_max_attempts
+            )
+            logger.info("Database mode initialized successfully")
+        else:
+            # File mode: clear results with errors
+            removed, remained = filter_results_by_reason_codes(self.config.results_json, ("429", "503"))
+            logger.info("Очищено записей с ошибками 429/503: %s, осталось: %s", removed, remained)
+
+        # Initialize ValidationExecutor
         self._validation_executor = ValidationExecutor(
             config=self.config,
             analyzer=self._analyzer,
@@ -255,12 +361,9 @@ class SellerValidatorAgent:
             processed_urls_lock=self._processed_urls_lock,
             processed_urls_path=self.config.processed_urls_txt,
             passed_urls_path=self.config.passed_urls_txt,
+            result_repository=self._result_repository,
+            task_repository=self._task_repository,
         )
-
-    async def run(self) -> None:
-        # Очистка результатов Gemini с ошибками 429/503 перед формированием очереди
-        removed, remained = filter_results_by_reason_codes(self.config.results_json, ("429", "503"))
-        logger.info("Очищено записей с ошибками 429/503: %s, осталось: %s", removed, remained)
 
         await self._init_proxy_pool()
         await self._seed_queue()
@@ -285,6 +388,10 @@ class SellerValidatorAgent:
         finally:
             await self._validation_executor.shutdown()
             await self._analyzer.close()
+            # Close database connection if in database mode
+            if self.config.use_database:
+                await close_pool()
+                logger.info("Database connection closed")
 
     def _create_analyzer(self):
         if self.config.llm_provider is LLMProvider.GENAI:
@@ -295,16 +402,51 @@ class SellerValidatorAgent:
 
     async def _init_proxy_pool(self) -> None:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
-        self._proxy_pool = await ProxyPool.create(
-            proxies_file=self.config.proxies_file, blocked_file=self.config.blocked_proxies_file
-        )
-        proxies = await self._proxy_pool.all_proxies()
-        if not proxies:
-            raise RuntimeError("Файл proxies.txt пуст или не найден")
-        all_blocked = await self._proxy_pool.all_blocked()
-        logger.info("Загружено %s прокси, все заблокированы: %s", len(proxies), all_blocked)
+
+        if self.config.use_database and self._proxy_repository:
+            # Database mode: load proxies from database
+            proxies = await self._proxy_repository.get_all_proxies()
+            if not proxies:
+                raise RuntimeError("No proxies found in database. Please load proxies using scripts/load_proxies.py")
+
+            # Create temporary files for ProxyPool (it still uses file-based API)
+            import tempfile
+            temp_dir = Path(tempfile.gettempdir()) / "avito_seller_checker"
+            temp_dir.mkdir(exist_ok=True, parents=True)
+            temp_proxies_file = temp_dir / "proxies.txt"
+            temp_blocked_file = temp_dir / "blocked_proxies.txt"
+
+            # Write proxies to temp file
+            with open(temp_proxies_file, 'w') as f:
+                f.write('\n'.join(proxies))
+
+            # Empty blocked file (blocked status is in database)
+            temp_blocked_file.touch()
+
+            self._proxy_pool = await ProxyPool.create(
+                proxies_file=temp_proxies_file,
+                blocked_file=temp_blocked_file
+            )
+            logger.info("Loaded %s proxies from database", len(proxies))
+        else:
+            # File mode: load from files
+            self._proxy_pool = await ProxyPool.create(
+                proxies_file=self.config.proxies_file,
+                blocked_file=self.config.blocked_proxies_file
+            )
+            proxies = await self._proxy_pool.all_proxies()
+            if not proxies:
+                raise RuntimeError("Файл proxies.txt пуст или не найден")
+            all_blocked = await self._proxy_pool.all_blocked()
+            logger.info("Загружено %s прокси, все заблокированы: %s", len(proxies), all_blocked)
 
     async def _seed_queue(self) -> None:
+        if self.config.use_database:
+            # Database mode: tasks are loaded via scripts, skip seeding
+            logger.info("Database mode: skipping queue seeding (use scripts/load_urls.py to load tasks)")
+            return
+
+        # File mode: load from urls.txt and filter by results.json
         urls = list(dict.fromkeys(iter_urls(self.config.urls_file)))
         existing_in_results = read_results_urls(self.config.results_json)
         new_urls = [url for url in urls if url not in existing_in_results]

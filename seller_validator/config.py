@@ -71,6 +71,16 @@ class Config:
     worker_relaunch_delay: float = 3.0
     checkpoint_flush_interval: int = 1
 
+    # Database settings
+    use_database: bool = True
+    db_host: str = "81.30.105.134"
+    db_port: int = 5414
+    db_name: str = "avito_seller_checker"
+    db_user: str = "admin"
+    db_password: str = "Password123"
+    db_pool_min_size: int = 5
+    db_pool_max_size: int = 20
+
     def __post_init__(self) -> None:
         self.data_dir = self.project_root / "data"
         self.urls_file = self.data_dir / "urls.txt"
