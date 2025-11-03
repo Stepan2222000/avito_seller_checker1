@@ -36,9 +36,10 @@ class GeminiAnalyzer:
     def __init__(self, config: Config) -> None:
         self.config = config
 
-        # Load credentials from service account key file
+        # Load credentials from service account key file with required scopes
         credentials = service_account.Credentials.from_service_account_file(
-            str(self.config.vertex_service_account_path)
+            str(self.config.vertex_service_account_path),
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
 
         # Initialize Vertex AI client

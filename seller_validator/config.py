@@ -20,7 +20,7 @@ class Config:
     processed_urls_txt: Path = field(init=False)
     passed_urls_txt: Path = field(init=False)
 
-    worker_count: int = 4
+    worker_count: int = 3
     queue_max_attempts: int = 4
     queue_idle_sleep: float = 0.5
 
