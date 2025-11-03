@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Data files (runtime)
+data/blocked_proxies.txt
+data/results.json
+data/processed_urls.txt
+data/passed_urls.txt
+data/gemini_payloads.log
+
+# Keep only template data files
+!data/urls.txt
+!data/proxies.txt
+
+# Secrets
+*.json
+!gen-lang-client-0026618973-91c1fd5d6f57.json
